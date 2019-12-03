@@ -87,7 +87,7 @@ const std::string prepare_subdirs_path = "/system/bin/vold_prepare_subdirs";
 const std::string systemwide_volume_key_dir =
     std::string() + DATA_MNT_POINT + "/misc/vold/volume_keys";
 
-bool s_global_de_initialized = false;
+bool s_systemwide_keys_initialized = false;
 
 // Some users are ephemeral, don't try to wipe their keys from disk
 std::set<userid_t> s_ephemeral_users;
@@ -394,17 +394,16 @@ static bool load_all_de_keys() {
     return true;
 }
 
-bool fscrypt_initialize_global_de() {
-    LOG(INFO) << "fscrypt_initialize_global_de";
-    bool wrapped_key_supported = false;
+bool fscrypt_initialize_systemwide_keys() {
+    LOG(INFO) << "fscrypt_initialize_systemwide_keys";
 
-    if (s_global_de_initialized) {
+    if (s_systemwide_keys_initialized) {
         LOG(INFO) << "Already initialized";
         return true;
     }
 
     PolicyKeyRef device_ref;
-    wrapped_key_supported = is_wrapped_key_supported();
+    bool wrapped_key_supported = is_wrapped_key_supported();
 
     if (!android::vold::retrieveAndInstallKey(true, kEmptyAuthentication,
                        device_key_path, device_key_temp,
@@ -418,11 +417,18 @@ bool fscrypt_initialize_global_de() {
 
     std::string ref_filename = std::string("/data") + fscrypt_key_ref;
     if (!android::vold::writeStringToFile(device_ref.key_raw_ref, ref_filename)) return false;
-
     LOG(INFO) << "Wrote system DE key reference to:" << ref_filename;
 
+    KeyBuffer per_boot_key;
+    if (!android::vold::randomKey(&per_boot_key)) return false;
+    std::string per_boot_raw_ref;
+    if (!android::vold::installKey(per_boot_key, &per_boot_raw_ref)) return false;
+    std::string per_boot_ref_filename = std::string("/data") + fscrypt_key_per_boot_ref;
+    if (!android::vold::writeStringToFile(per_boot_raw_ref, per_boot_ref_filename)) return false;
+    LOG(INFO) << "Wrote per boot key reference to:" << per_boot_ref_filename;
+
     if (!android::vold::FsyncDirectory(device_key_dir)) return false;
-    s_global_de_initialized = true;
+    s_systemwide_keys_initialized = true;
     return true;
 }
 
