@@ -80,6 +80,7 @@ static const unsigned int kMajorBlockDynamicMin = 234;
 static const unsigned int kMajorBlockDynamicMax = 512;
 
 static const char* kGptBasicData = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+static const char* kGptLinuxFilesystem = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
 static const char* kGptAndroidMeta = "19A710A2-B3CA-11E4-B026-10604B889DCF";
 static const char* kGptAndroidExpand = "193D1EA4-B3CA-11E4-B075-10604B889DCF";
 
@@ -127,7 +128,8 @@ Disk::Disk(const std::string& eventPath, dev_t device, const std::string& nickna
       mNickname(nickname),
       mFlags(flags),
       mCreated(false),
-      mJustPartitioned(false) {
+      mJustPartitioned(false),
+      mSkipChange(false) {
     mId = StringPrintf("disk:%u,%u", major(device), minor(device));
     mEventPath = eventPath;
     mSysPath = StringPrintf("/sys/%s", eventPath.c_str());
@@ -185,8 +187,10 @@ status_t Disk::destroy() {
     return OK;
 }
 
-void Disk::createPublicVolume(dev_t device) {
-    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(device));
+void Disk::createPublicVolume(dev_t device,
+                const std::string& fstype /* = "" */,
+                const std::string& mntopts /* = "" */) {
+    auto vol = std::shared_ptr<VolumeBase>(new PublicVolume(device, fstype, mntopts));
     if (mJustPartitioned) {
         LOG(DEBUG) << "Device just partitioned; silently formatting";
         vol->setSilent(true);
@@ -240,6 +244,11 @@ void Disk::destroyAllVolumes() {
 }
 
 status_t Disk::readMetadata() {
+
+    if (mSkipChange) {
+        return OK;
+    }
+
     mSize = -1;
     mLabel.clear();
 
@@ -331,6 +340,12 @@ status_t Disk::readPartitions() {
         return -ENOTSUP;
     }
 
+    if (mSkipChange) {
+        mSkipChange = false;
+        LOG(INFO) << "Skip first change";
+        return OK;
+    }
+
     destroyAllVolumes();
 
     // Parse partition table
@@ -394,6 +409,7 @@ status_t Disk::readPartitions() {
                     case 0x0b:  // W95 FAT32 (LBA)
                     case 0x0c:  // W95 FAT32 (LBA)
                     case 0x0e:  // W95 FAT16 (LBA)
+                    case 0x83:  // Linux EXT4/F2FS/...
                         createPublicVolume(partDevice);
                         break;
                 }
@@ -403,7 +419,8 @@ status_t Disk::readPartitions() {
                 if (++it == split.end()) continue;
                 auto partGuid = *it;
 
-                if (android::base::EqualsIgnoreCase(typeGuid, kGptBasicData)) {
+                if (android::base::EqualsIgnoreCase(typeGuid, kGptBasicData)
+                        || android::base::EqualsIgnoreCase(typeGuid, kGptLinuxFilesystem)) {
                     createPublicVolume(partDevice);
                 } else if (android::base::EqualsIgnoreCase(typeGuid, kGptAndroidExpand)) {
                     createPrivateVolume(partDevice, partGuid);
@@ -445,8 +462,45 @@ status_t Disk::partitionPublic() {
     destroyAllVolumes();
     mJustPartitioned = true;
 
-    // First nuke any existing partition table
+    // Determine if we're coming from MBR
     std::vector<std::string> cmd;
+    cmd.push_back(kSgdiskPath);
+    cmd.push_back("--android-dump");
+    cmd.push_back(mDevPath);
+
+    std::vector<std::string> output;
+    res = ForkExecvp(cmd, &output);
+    if (res != OK) {
+        LOG(WARNING) << "sgdisk failed to scan " << mDevPath;
+        mJustPartitioned = false;
+        return res;
+    }
+
+    Table table = Table::kUnknown;
+    for (auto line : output) {
+        char* cline = (char*) line.c_str();
+        char* token = strtok(cline, kSgdiskToken);
+        if (token == nullptr) continue;
+
+        if (!strcmp(token, "DISK")) {
+            const char* type = strtok(nullptr, kSgdiskToken);
+            if (!strcmp(type, "mbr")) {
+                table = Table::kMbr;
+                break;
+            } else if (!strcmp(type, "gpt")) {
+                table = Table::kGpt;
+                break;
+            }
+        }
+    }
+
+    if (table == Table::kMbr) {
+        LOG(INFO) << "skip first disk change event due to MBR -> GPT switch";
+        mSkipChange = true;
+    }
+
+    // First nuke any existing partition table
+    cmd.clear();
     cmd.push_back(kSgdiskPath);
     cmd.push_back("--zap-all");
     cmd.push_back(mDevPath);

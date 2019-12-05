@@ -18,6 +18,9 @@
 #include "Utils.h"
 #include "VolumeManager.h"
 #include "fs/Exfat.h"
+#include "fs/Ext4.h"
+#include "fs/F2fs.h"
+#include "fs/Ntfs.h"
 #include "fs/Vfat.h"
 
 #include <android-base/logging.h>
@@ -45,7 +48,10 @@ static const char* kFusePath = "/system/bin/sdcard";
 
 static const char* kAsecPath = "/mnt/secure/asec";
 
-PublicVolume::PublicVolume(dev_t device) : VolumeBase(Type::kPublic), mDevice(device), mFusePid(0) {
+PublicVolume::PublicVolume(dev_t device, const std::string& fstype /* = "" */,
+        const std::string& mntopts /* = "" */)
+        : VolumeBase(Type::kPublic), mDevice(device), mFusePid(0),
+        mFsType(fstype), mMntOpts(mntopts) {
     setId(StringPrintf("public:%u,%u", major(device), minor(device)));
     mDevPath = StringPrintf("/dev/block/vold/%s", getId().c_str());
 }
@@ -95,17 +101,7 @@ status_t PublicVolume::doDestroy() {
 status_t PublicVolume::doMount() {
     readMetadata();
 
-    if (mFsType == "vfat" && vfat::IsSupported()) {
-        if (vfat::Check(mDevPath)) {
-            LOG(ERROR) << getId() << " failed filesystem check";
-            return -EIO;
-        }
-    } else if (mFsType == "exfat" && exfat::IsSupported()) {
-        if (exfat::Check(mDevPath)) {
-            LOG(ERROR) << getId() << " failed filesystem check";
-            return -EIO;
-        }
-    } else {
+    if (!IsFilesystemSupported(mFsType)) {
         LOG(ERROR) << getId() << " unsupported filesystem " << mFsType;
         return -EIO;
     }
@@ -135,17 +131,43 @@ status_t PublicVolume::doMount() {
         return -errno;
     }
 
-    if (mFsType == "vfat") {
-        if (vfat::Mount(mDevPath, mRawPath, false, false, false, AID_MEDIA_RW, AID_MEDIA_RW, 0007,
-                        true)) {
-            PLOG(ERROR) << getId() << " failed to mount " << mDevPath;
-            return -EIO;
-        }
-    } else if (mFsType == "exfat") {
-        if (exfat::Mount(mDevPath, mRawPath, AID_MEDIA_RW, AID_MEDIA_RW, 0007)) {
-            PLOG(ERROR) << getId() << " failed to mount " << mDevPath;
-            return -EIO;
-        }
+    int ret = 0;
+    if (mFsType == "exfat") {
+        ret = exfat::Check(mDevPath);
+    } else if (mFsType == "ext4") {
+        ret = ext4::Check(mDevPath, mRawPath, false);
+    } else if (mFsType == "f2fs") {
+        ret = f2fs::Check(mDevPath, false);
+    } else if (mFsType == "ntfs") {
+        ret = ntfs::Check(mDevPath);
+    } else if (mFsType == "vfat") {
+        ret = vfat::Check(mDevPath);
+    } else {
+        LOG(WARNING) << getId() << " unsupported filesystem check, skipping";
+    }
+    if (ret) {
+        LOG(ERROR) << getId() << " failed filesystem check";
+        return -EIO;
+    }
+
+    if (mFsType == "exfat") {
+        ret = exfat::Mount(mDevPath, mRawPath, AID_MEDIA_RW, AID_MEDIA_RW, 0007);
+    } else if (mFsType == "ext4") {
+        ret = ext4::Mount(mDevPath, mRawPath, false, false, true, mMntOpts,
+                false, true);
+    } else if (mFsType == "f2fs") {
+        ret = f2fs::Mount(mDevPath, mRawPath, mMntOpts, false, true);
+    } else if (mFsType == "ntfs") {
+        ret = ntfs::Mount(mDevPath, mRawPath, AID_MEDIA_RW, AID_MEDIA_RW, 0007);
+    } else if (mFsType == "vfat") {
+        ret = vfat::Mount(mDevPath, mRawPath, false, false, false,
+                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true);
+    } else {
+        ret = ::mount(mDevPath.c_str(), mRawPath.c_str(), mFsType.c_str(), 0, NULL);
+    }
+    if (ret) {
+        PLOG(ERROR) << getId() << " failed to mount " << mDevPath;
+        return -EIO;
     }
 
     if (getMountFlags() & MountFlags::kPrimary) {
@@ -279,7 +301,7 @@ status_t PublicVolume::doFormat(const std::string& fsType) {
         useVfat = false;
     }
 
-    if (!useVfat && !useExfat) {
+    if (!IsFilesystemSupported(fsType) && !useVfat && !useExfat) {
         LOG(ERROR) << "Unsupported filesystem " << fsType;
         return -EINVAL;
     }
@@ -292,6 +314,16 @@ status_t PublicVolume::doFormat(const std::string& fsType) {
         res = vfat::Format(mDevPath, 0);
     } else if (useExfat) {
         res = exfat::Format(mDevPath);
+    } else if (fsType == "ext4") {
+        res = ext4::Format(mDevPath, 0, mRawPath);
+    } else if (fsType == "f2fs") {
+        res = f2fs::Format(mDevPath);
+    } else if (fsType == "ntfs") {
+        res = ntfs::Format(mDevPath);
+    } else {
+        LOG(ERROR) << getId() << " unrecognized filesystem " << fsType;
+        res = -1;
+        errno = EIO;
     }
 
     if (res != OK) {
